@@ -1,94 +1,82 @@
-# "internal error" On Tables 63 Characters Wide Or More
+# "internal error" From translate_headline — Resolved In 5.9.1
 
-A reproduction for a regression introduced in pspg 5.9.0 and still
-present on master. Kept on a branch of a fork so that the finding, the
-fixtures and the bisection survive; it is not a fix.
+A record of a regression that cost a downstream user a day, kept so
+the next person who meets the symptom can skip the investigation.
 
 ## TOPLINE
 
-pspg 5.9.0 aborts with `internal error` on any psql-format table whose
-total width is 63 characters or more, at every terminal size and
-whatever the cell contents. 5.8.16 renders the same input correctly.
-Six `leave("internal error")` assertions were added to `src/infra.c`
-in 5.9.0; one of them fires.
+pspg 5.9.0 could abort with `internal error` before drawing anything.
+The cause was `translate_headline` measuring one buffer against
+another buffer's end pointer; a bounds assertion added in the same
+release turned a latent out-of-bounds read into an abort. Fixed
+upstream in `61847ae` and released in **5.9.1**. Nothing to do here
+but upgrade.
 
-## REPRODUCING IT
+## THE CAUSE
 
-```bash
-regression/wide-table/check            # the pspg on PATH
-regression/wide-table/check ./pspg     # a build under test
+`src/table.c`, in `translate_headline`:
+
+```c
+-  nextchar = namesline + charlen_range(namesline, ptrend);
+-  display_width = dsplen_range(namesline, ptrend);
++  nextchar = namesline + charlen_range(namesline, namesline_end);
++  display_width = dsplen_range(namesline, namesline_end);
 ```
 
-Three fixtures sit either side of the threshold:
+`ptrend` points into the **headline**. The string being measured is
+the **namesline**. The two are separate allocations, so `ptrend` is
+not a valid end pointer for `namesline` and the read could run past
+its end.
 
-| Fixture | Border width | 5.8.16  | 5.9.0 |
-|-------------|------|---------|----------------|
-| `w62.psql`  | 62   | renders | renders |
-| `w63.psql`  | 63   | renders | `internal error` |
-| `w80.psql`  | 80   | renders | `internal error` |
+5.9.0 also added six `leave("internal error")` assertions to
+`src/infra.c`, among them:
 
-A pass on `w62` with a failure on `w63` is this bug. Failures on all
-three are something else, which is why `w62` is in the set.
+```c
+dsplen_range(const char *str, const char *end)
+{
+    if (end <= str)
+        leave("internal error");
+```
 
-The fixtures are plain psql output, five lines each, with no multibyte
-characters. The content does not matter; only the width does.
+When the headline happened to be allocated **below** the namesline,
+`end <= str` held and pspg aborted. The same code in 5.8.16 read out
+of bounds silently and usually got away with it. The 5.9.0 assertion
+did not create the bug; it made an old one visible.
 
-## WHAT IS ESTABLISHED
+## WHY IT LOOKED LIKE A WIDTH PROBLEM
 
-- 5.8.16 contains **no** `leave("internal error")` in `src/infra.c`.
-  5.9.0 contains **six**, added in the same change that introduced the
-  `charlen_limit` / `dsplen_limit` bounds checks.
-- The one that can fire on ASCII input is `charlen_limit`, which calls
-  `leave` when its `limit` argument is below 1:
+It is heap-layout dependent, not width dependent. Allocation sizes
+move the two buffers relative to each other, so a bigger result set
+changes whether `ptrend` lands below `namesline`. A downstream bisect
+on table width found a clean threshold of 63 characters on one data
+set and concluded the width was the trigger. It was not.
 
-      inline int
-      charlen_limit(const char *str, int limit)
-      {
-          if (limit < 1)
-              leave("internal error");
+That conclusion was tested and does not hold. Against a real 5.9.0
+build, **117 synthetic tables** — varying column count, column width,
+row count, column-name length and trailing-space handling, including
+widths either side of 63 — produced no failure at all. Only the
+original query reproduced it.
 
-- The regression reproduces at every terminal size, so it is not a
-  question of the table being wider than the window.
-- Master still reproduced it when last checked (d30073e, 2026-10-22),
-  despite the multibyte fixes that landed after 5.9.0.
+The lesson for anyone chasing something similar: a synthetic fixture
+will not reproduce a layout-dependent fault, and a fixture that passes
+on the broken version is worse than none, because it reads as evidence.
 
-## WHAT IS NOT ESTABLISHED
+## VERSIONS
 
-**Which call site passes the non-positive limit.** The candidates are
-in `src/print.c`, `src/table.c`, `src/pretty-csv.c` and `src/export.c`.
-The `src/print.c` path in `print_row` is the most likely, because it
-walks a decoration row byte by byte while rewriting ASCII borders as
-ACS line characters, and it is reached for exactly this kind of input:
+| Version | Behaviour |
+|---------|-----------------------------------------------|
+| 5.8.16  | Reads out of bounds, renders anyway |
+| 5.9.0   | Asserts and aborts with `internal error` |
+| 5.9.1   | Fixed |
 
-    while (bytes > 0)
-    {
-        int column_format = desc->headline_transl[offsetx];
-        ...
-        int len = charlen_limit(rowstr, bytes);
+Upstream issue: okbob/pspg#273, opened 2026-10-30, closed 2026-11-06.
+Fix commit: `61847ae`, 2026-11-02.
 
-Its own loop condition keeps `bytes` above zero, so either `bytes`
-arrives negative or the firing site is elsewhere. Settling it needs a
-debug build and a breakpoint on `leave`, which has not been done.
+## WHY THIS BRANCH EXISTS
 
-Anyone picking this up should start there rather than from the
-symptom.
+A pinned Homebrew formula held 5.8.16 downstream for five weeks while
+the cause was unknown. The pin is retired and the formula is kept as a
+worked example in the denviro repository, at `config/brew/`.
 
-## WHY 63
-
-Not known. 63 is one less than 64, which invites a theory about a
-buffer or a bit width, but nothing here confirms one. The threshold
-was found by bisecting fixture widths, not by reading the code.
-
-## MEANWHILE
-
-Downstream, the remedy is to stay on 5.8.16. The pinned Homebrew
-formula and the same fixtures are kept at `config/brew/` in the
-denviro repository, whose README says when the pin may be dropped:
-when `check` passes against a newer build.
-
-## IF THIS GOES UPSTREAM
-
-Not yet filed. A report wants the three fixtures, the version
-comparison above, and the honest note that the call site is not
-pinned down — a maintainer who knows the width arithmetic will find it
-faster than a bisect will.
+The fork carries no patch and proposes none. It is somewhere to put
+one next time.
